@@ -997,8 +997,16 @@ EXERCISE_CATALOG = {
         {
             "id": "biceps_curl",
             "name": "Biceps Curl",
-            "equipment": ["Dumbbells", "Barbell", "Cable"],
-            "movement_type": "Bilateral",
+            "equipment": [
+                "Dumbbells",
+                "Barbell",
+                "Cable",
+                "Selectorized Machine",
+                "Plate-loaded Machine",
+            ],
+            # Biceps curls can be performed with both arms together or one side at a time,
+            # depending on the cable, dumbbells, or machine being used.
+            "movement_type": None,
         },
         {
             "id": "triceps_pushdown",
@@ -1756,14 +1764,6 @@ elif page == PAGE_WORKOUT:
             )
             st.caption(f"{equipment} · {readable_movement}")
 
-            if st.session_state.get("rest_timer_end"):
-                render_rest_timer_fragment()
-            elif st.session_state.get("rest_timer_finished"):
-                st.success("Rest complete. Ready for the next set.")
-                if st.button("Dismiss timer", key="dismiss_rest_timer", use_container_width=True):
-                    clear_rest_timer()
-                    st.rerun()
-
             with st.expander("Rest timer settings", expanded=False):
                 timer_options = {
                     "Off": 0,
@@ -2026,6 +2026,20 @@ elif page == PAGE_WORKOUT:
                     ),
                 )
                 total_load = float(weight)
+
+            # Keep the live rest timer beside the active set inputs so the user
+            # does not need to scroll back to the top during a workout.
+            if st.session_state.get("rest_timer_end"):
+                render_rest_timer_fragment()
+            elif st.session_state.get("rest_timer_finished"):
+                st.success("Rest complete. Ready for the next set.")
+                if st.button(
+                    "Dismiss timer",
+                    key="dismiss_rest_timer_near_active_set",
+                    use_container_width=True,
+                ):
+                    clear_rest_timer()
+                    st.rerun()
 
             if movement_type == "Bilateral":
                 reps = st.number_input(
