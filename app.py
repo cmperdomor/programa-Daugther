@@ -1,8 +1,12 @@
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import uuid4
+import math
+import time as time_module
 
 import pandas as pd
 import streamlit as st
+import extra_streamlit_components as stx
+from cryptography.fernet import Fernet, InvalidToken
 from supabase import create_client
 
 st.set_page_config(
@@ -14,6 +18,22 @@ st.set_page_config(
 SUPABASE_URL = st.secrets["SUPABASE_URL"].strip()
 SUPABASE_KEY = st.secrets["SUPABASE_PUBLISHABLE_KEY"].strip()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Persistent browser login. The refresh token is encrypted before it is stored
+# in a browser cookie. SESSION_COOKIE_SECRET must be a Fernet-compatible key.
+try:
+    SESSION_COOKIE_SECRET = st.secrets["SESSION_COOKIE_SECRET"].strip()
+except Exception:
+    SESSION_COOKIE_SECRET = ""
+
+SESSION_COOKIE_NAME = "daughter_lift_session_v1"
+SESSION_COOKIE_DAYS = 30
+try:
+    SESSION_FERNET = Fernet(SESSION_COOKIE_SECRET.encode()) if SESSION_COOKIE_SECRET else None
+except Exception:
+    SESSION_FERNET = None
+
+cookie_manager = stx.CookieManager(key="daughter_lift_cookie_manager")
 
 AUTH_KEYS = ["access_token", "refresh_token", "user_id", "user_email"]
 WORKOUT_STATE_KEYS = [
@@ -31,6 +51,7 @@ PAGE_WORKOUT = "🏋️ Workout"
 PAGE_PROGRESS = "📈 Progress"
 PAGE_HISTORY = "📚 History"
 PAGE_PROFILE = "👤 Profile"
+PAGE_HELP = "How to use"
 PAGE_ADMIN = "🛡️ Admin"
 
 
@@ -38,40 +59,124 @@ PAGE_ADMIN = "🛡️ Admin"
 # AUTH
 # ============================================================
 
+def _cookie_key(action):
+    seq = int(st.session_state.get("_cookie_seq", 0)) + 1
+    st.session_state["_cookie_seq"] = seq
+    return f"{action}_{seq}"
+
+
+def _encrypt_refresh_token(refresh_token):
+    if not SESSION_FERNET or not refresh_token:
+        return None
+    return SESSION_FERNET.encrypt(refresh_token.encode()).decode()
+
+
+def _decrypt_refresh_token(value):
+    if not SESSION_FERNET or not value:
+        return None
+    try:
+        return SESSION_FERNET.decrypt(value.encode()).decode()
+    except (InvalidToken, ValueError, TypeError):
+        return None
+
+
+def persist_refresh_token(refresh_token):
+    encrypted = _encrypt_refresh_token(refresh_token)
+    if not encrypted:
+        return False
+    try:
+        current_url = str(getattr(st.context, "url", "") or "")
+        cookie_manager.set(
+            SESSION_COOKIE_NAME,
+            encrypted,
+            key=_cookie_key("set_auth_cookie"),
+            path="/",
+            expires_at=datetime.now() + timedelta(days=SESSION_COOKIE_DAYS),
+            secure=current_url.startswith("https://"),
+            same_site="lax",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def remove_persistent_login():
+    try:
+        cookie_manager.delete(
+            SESSION_COOKIE_NAME,
+            key=_cookie_key("delete_auth_cookie"),
+        )
+    except Exception:
+        pass
+
+
 def clear_auth_state():
     for key in AUTH_KEYS + ["nav_page"] + WORKOUT_STATE_KEYS:
         st.session_state.pop(key, None)
 
 
-def save_auth_session(auth_response):
+def save_auth_session(auth_response, persist=True):
     if auth_response is None or auth_response.session is None:
         return False
-    st.session_state["access_token"] = auth_response.session.access_token
-    st.session_state["refresh_token"] = auth_response.session.refresh_token
-    st.session_state["user_id"] = auth_response.user.id
-    st.session_state["user_email"] = auth_response.user.email
+
+    previous_refresh = st.session_state.get("refresh_token")
+    session = auth_response.session
+    user = auth_response.user or session.user
+
+    st.session_state["access_token"] = session.access_token
+    st.session_state["refresh_token"] = session.refresh_token
+    st.session_state["user_id"] = user.id
+    st.session_state["user_email"] = user.email
+
+    # Supabase rotates refresh tokens. Update the encrypted browser cookie only
+    # when a new refresh token is issued.
+    if persist and session.refresh_token and session.refresh_token != previous_refresh:
+        persist_refresh_token(session.refresh_token)
     return True
 
 
 def restore_auth_session():
     access_token = st.session_state.get("access_token")
     refresh_token = st.session_state.get("refresh_token")
-    if not access_token or not refresh_token:
-        return False
-    try:
-        if save_auth_session(supabase.auth.set_session(access_token, refresh_token)):
-            return True
-    except Exception:
-        pass
+
+    # Normal Streamlit rerun: restore the session into the new Supabase client.
+    if access_token and refresh_token:
+        try:
+            response = supabase.auth.set_session(access_token, refresh_token)
+            if save_auth_session(response, persist=True):
+                return True
+        except Exception:
+            clear_auth_state()
+
+    # New Streamlit session / browser reload / app wake-up: restore from the
+    # encrypted refresh-token cookie.
+    if SESSION_FERNET:
+        try:
+            encrypted = cookie_manager.get(SESSION_COOKIE_NAME)
+        except Exception:
+            encrypted = None
+
+        stored_refresh = _decrypt_refresh_token(encrypted)
+        if stored_refresh:
+            try:
+                response = supabase.auth.refresh_session(stored_refresh)
+                if save_auth_session(response, persist=True):
+                    return True
+            except Exception:
+                remove_persistent_login()
+
     clear_auth_state()
     return False
 
 
 def logout():
     try:
+        # Default Supabase sign-out may revoke the session. The local browser
+        # cookie is removed as well so this device stays signed out.
         supabase.auth.sign_out()
     except Exception:
         pass
+    remove_persistent_login()
     clear_auth_state()
 
 
@@ -153,6 +258,96 @@ def get_weight_history(user_id, limit=100):
 
 def parse_ts(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def has_completed_workout(user_id):
+    response = (
+        supabase.table("workouts")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("status", "completed")
+        .limit(1)
+        .execute()
+    )
+    return bool(response.data)
+
+
+def render_how_to_use():
+    st.markdown("""
+### Getting started
+
+**1. Start a workout**  
+Choose Lower Body, Upper Body, or Core.
+
+**2. Choose an exercise and the equipment you are actually using**  
+The same exercise on different equipment is tracked as a different setup so the progress comparison stays meaningful.
+
+**3. Record every working set**  
+Enter the load, repetitions, and optionally RIR. Press **Add set** after each set.
+
+**4. Rest before the next set**  
+The rest timer starts automatically after a set is saved. You can choose the rest duration, add 30 seconds, or skip it.
+
+**5. Continue or correct mistakes**  
+Use **Edit set** if you entered the wrong weight, repetitions, or RIR. Use **Next exercise** when you are finished with the current exercise.
+
+**6. Finish the workout**  
+Press **Finish workout** so the session becomes part of your Progress and History.
+
+### Key terms
+
+**Reps (repetitions):** how many complete repetitions you performed.  
+**RIR (Reps In Reserve):** how many additional good repetitions you think you could have performed. RIR 0 means no more good reps were possible.  
+**1RM (One-Repetition Maximum):** the maximum load you can actually lift once.  
+**e1RM (Estimated One-Repetition Maximum):** a calculated estimate, not a directly measured maximum.
+
+### How Daughter Lift measures progress
+
+The main comparison is **the same exercise + the same equipment/setup over time**. Progress can mean lifting more weight, doing more repetitions at the same weight, or both.
+
+Machine and cable loads are compared only within the same exercise/setup because different machines can have different mechanical characteristics.
+""")
+
+
+# ============================================================
+# REST TIMER
+# ============================================================
+
+def clear_rest_timer():
+    for key in ["rest_timer_end", "rest_timer_finished"]:
+        st.session_state.pop(key, None)
+
+
+def start_rest_timer(seconds):
+    seconds = max(15, int(seconds))
+    st.session_state["rest_timer_end"] = time_module.time() + seconds
+    st.session_state["rest_timer_finished"] = False
+
+
+@st.fragment(run_every=1)
+def render_rest_timer_fragment():
+    end = st.session_state.get("rest_timer_end")
+    if not end:
+        return
+
+    remaining = max(0, int(math.ceil(float(end) - time_module.time())))
+    if remaining <= 0:
+        st.session_state.pop("rest_timer_end", None)
+        st.session_state["rest_timer_finished"] = True
+        st.rerun()
+        return
+
+    minutes, seconds = divmod(remaining, 60)
+    st.metric("Rest timer", f"{minutes:02d}:{seconds:02d}")
+    add_col, skip_col = st.columns(2)
+    with add_col:
+        if st.button("+30 sec", key="rest_timer_plus_30", use_container_width=True):
+            st.session_state["rest_timer_end"] = float(end) + 30
+            st.rerun(scope="fragment")
+    with skip_col:
+        if st.button("Skip rest", key="rest_timer_skip", use_container_width=True):
+            clear_rest_timer()
+            st.rerun()
 
 
 # ============================================================
@@ -467,7 +662,7 @@ def update_bilateral_set(
         workout_id="placeholder",
         exercise_instance_id=exercise_instance_id,
         set_num=set_num,
-        side="Both",
+        side="Bilateral",
         weight=weight,
         unit=unit,
         total_load=total_load,
@@ -485,7 +680,7 @@ def update_bilateral_set(
         .update(update_values)
         .eq("exercise_instance_id", exercise_instance_id)
         .eq("set_num", int(set_num))
-        .eq("side", "Both")
+        .eq("side", "Bilateral")
         .eq("user_id", user_id)
         .execute()
     )
@@ -781,6 +976,25 @@ EXERCISE_CATALOG = {
             "movement_type": "Bilateral",
         },
         {
+            "id": "dumbbell_front_raise",
+            "name": "Dumbbell Front Raise",
+            "equipment": ["Dumbbells"],
+            # Can be performed with both arms together or one side at a time.
+            "movement_type": None,
+        },
+        {
+            "id": "pec_deck_fly",
+            "name": "Pec Deck Fly",
+            "equipment": ["Selectorized Machine"],
+            "movement_type": "Bilateral",
+        },
+        {
+            "id": "reverse_pec_deck",
+            "name": "Reverse Pec Deck",
+            "equipment": ["Selectorized Machine"],
+            "movement_type": "Bilateral",
+        },
+        {
             "id": "biceps_curl",
             "name": "Biceps Curl",
             "equipment": ["Dumbbells", "Barbell", "Cable"],
@@ -844,7 +1058,9 @@ logged_in = restore_auth_session()
 
 if not logged_in:
     st.subheader("Welcome")
-    sign_in_tab, create_tab = st.tabs(["Sign in", "Create account"])
+    sign_in_tab, create_tab, reset_tab = st.tabs(
+        ["Sign in", "Create account", "Forgot password?"]
+    )
 
     with sign_in_tab:
         with st.form("sign_in_form"):
@@ -860,13 +1076,15 @@ if not logged_in:
                     response = supabase.auth.sign_in_with_password(
                         {"email": email.strip(), "password": password}
                     )
-                    if save_auth_session(response):
+                    if save_auth_session(response, persist=True):
+                        # Give the browser component a moment to write the encrypted
+                        # refresh-token cookie before the full rerun.
+                        time_module.sleep(0.25)
                         st.rerun()
                     else:
                         st.error("Login did not create a session.")
-                except Exception as exc:
+                except Exception:
                     st.error("Could not sign in. Check your email and password.")
-                    st.caption(str(exc))  # TODO remove before public launch
 
     with create_tab:
         with st.form("create_account_form"):
@@ -908,15 +1126,108 @@ if not logged_in:
                             },
                         }
                     )
-                    if save_auth_session(response):
+                    if save_auth_session(response, persist=True):
+                        time_module.sleep(0.25)
                         st.rerun()
                     else:
                         st.success(
                             "Account created. Check your email to confirm it, then sign in."
                         )
-                except Exception as exc:
+                except Exception:
                     st.error("Could not create account.")
-                    st.caption(str(exc))  # TODO remove before public launch
+
+    with reset_tab:
+        reset_email = st.session_state.get("password_reset_email", "")
+
+        with st.form("password_reset_request_form"):
+            recovery_email = st.text_input(
+                "Email",
+                value=reset_email,
+                key="password_reset_request_email",
+            )
+            send_recovery = st.form_submit_button(
+                "Send recovery code",
+                use_container_width=True,
+            )
+
+        if send_recovery:
+            if not recovery_email.strip():
+                st.warning("Enter your email address.")
+            else:
+                try:
+                    supabase.auth.reset_password_for_email(recovery_email.strip())
+                    st.session_state["password_reset_email"] = recovery_email.strip()
+                    st.session_state["password_reset_requested"] = True
+                    st.success(
+                        "If an account exists for this email, a recovery message has been sent. "
+                        "Return here and enter the recovery code from the email."
+                    )
+                except Exception:
+                    # Keep the message neutral so the app does not reveal whether
+                    # an email is registered.
+                    st.info(
+                        "If an account exists for this email, a recovery message will be sent."
+                    )
+
+        if st.session_state.get("password_reset_requested") or reset_email:
+            st.caption("Use the recovery code from the Daughter Lift password-reset email.")
+            with st.form("password_reset_finish_form"):
+                recovery_code = st.text_input(
+                    "Recovery code",
+                    placeholder="6-digit code",
+                    key="password_reset_code",
+                )
+                reset_new_password = st.text_input(
+                    "New password",
+                    type="password",
+                    key="password_reset_new_password",
+                )
+                reset_repeat_password = st.text_input(
+                    "Repeat new password",
+                    type="password",
+                    key="password_reset_repeat_password",
+                )
+                finish_reset = st.form_submit_button(
+                    "Set new password",
+                    use_container_width=True,
+                )
+
+            if finish_reset:
+                email_for_reset = st.session_state.get("password_reset_email", "").strip()
+                if not email_for_reset:
+                    st.warning("Enter your email and request a recovery code first.")
+                elif not recovery_code.strip():
+                    st.warning("Enter the recovery code from the email.")
+                elif len(reset_new_password) < 8:
+                    st.warning("Use at least 8 characters for the new password.")
+                elif reset_new_password != reset_repeat_password:
+                    st.warning("The new passwords do not match.")
+                else:
+                    try:
+                        verified = supabase.auth.verify_otp(
+                            {
+                                "email": email_for_reset,
+                                "token": recovery_code.strip(),
+                                "type": "recovery",
+                            }
+                        )
+                        if not save_auth_session(verified, persist=True):
+                            raise RuntimeError("Recovery code did not create a session.")
+                        supabase.auth.update_user({"password": reset_new_password})
+                        st.session_state.pop("password_reset_email", None)
+                        st.session_state.pop("password_reset_requested", None)
+                        st.session_state["password_reset_success"] = True
+                        time_module.sleep(0.25)
+                        st.rerun()
+                    except Exception:
+                        st.error(
+                            "The recovery code is invalid or expired. Request a new code and try again."
+                        )
+
+    if not SESSION_FERNET:
+        st.caption(
+            "Persistent login is not configured yet. Add SESSION_COOKIE_SECRET to Streamlit Secrets."
+        )
 
     st.stop()
 
@@ -944,12 +1255,15 @@ role = profile.get("role") or "user"
 age = profile.get("age")
 height_cm = profile.get("height_cm")
 
-page_options = [PAGE_HOME, PAGE_WORKOUT, PAGE_PROGRESS, PAGE_HISTORY, PAGE_PROFILE]
+page_options = [PAGE_HOME, PAGE_WORKOUT, PAGE_PROGRESS, PAGE_HISTORY, PAGE_PROFILE, PAGE_HELP]
 if role == "admin":
     page_options.append(PAGE_ADMIN)
 
 if st.session_state.get("nav_page") not in page_options:
     st.session_state["nav_page"] = PAGE_HOME
+
+if st.session_state.pop("password_reset_success", False):
+    st.success("Password updated successfully. You are signed in.")
 
 st.sidebar.markdown(f"### 👤 {display_name}")
 st.sidebar.caption(user_email)
@@ -972,6 +1286,15 @@ if profile_incomplete and page != PAGE_PROFILE:
 
 if page == PAGE_HOME:
     st.header(f"Hi, {display_name} 👋")
+
+    try:
+        new_to_app = not has_completed_workout(user_id)
+    except Exception:
+        new_to_app = False
+
+    if new_to_app:
+        with st.expander("How to use Daughter Lift", expanded=True):
+            render_how_to_use()
 
     st.subheader("Body weight")
     try:
@@ -1289,6 +1612,11 @@ elif page == PAGE_WORKOUT:
 
             catalog = combined_catalog(user_id, workout_type)
             names = [x["name"] for x in catalog] + ["➕ Add custom exercise"]
+
+            pending_selection = st.session_state.pop("pending_exercise_selection", None)
+            if pending_selection in names:
+                st.session_state["exercise_picker"] = pending_selection
+
             selected_name = st.selectbox("Exercise", names, key="exercise_picker")
 
             if selected_name == "➕ Add custom exercise":
@@ -1307,12 +1635,14 @@ elif page == PAGE_WORKOUT:
                         st.warning("Enter an exercise name.")
                     else:
                         try:
-                            save_custom_exercise(user_id, custom_name, workout_type)
-                            st.success("Custom exercise saved ✅")
+                            saved_custom = save_custom_exercise(user_id, custom_name, workout_type)
+                            st.session_state["pending_exercise_selection"] = saved_custom["name"]
+                            st.success("Custom exercise saved.")
                             st.rerun()
-                        except Exception as exc:
+                        except ValueError as exc:
+                            st.info(str(exc))
+                        except Exception:
                             st.error("Custom exercise could not be saved.")
-                            st.caption(str(exc))
             else:
                 selected = next(x for x in catalog if x["name"] == selected_name)
 
@@ -1327,7 +1657,7 @@ elif page == PAGE_WORKOUT:
                     "Both sides together": "Bilateral",
                     "One side at a time": "Unilateral",
                 }
-                if selected["custom"]:
+                if selected["custom"] or selected.get("movement_type") is None:
                     movement_label = st.radio(
                         "How are you performing it?",
                         list(movement_labels.keys()),
@@ -1425,6 +1755,45 @@ elif page == PAGE_WORKOUT:
                 else "One side at a time"
             )
             st.caption(f"{equipment} · {readable_movement}")
+
+            if st.session_state.get("rest_timer_end"):
+                render_rest_timer_fragment()
+            elif st.session_state.get("rest_timer_finished"):
+                st.success("Rest complete. Ready for the next set.")
+                if st.button("Dismiss timer", key="dismiss_rest_timer", use_container_width=True):
+                    clear_rest_timer()
+                    st.rerun()
+
+            with st.expander("Rest timer settings", expanded=False):
+                timer_options = {
+                    "Off": 0,
+                    "60 seconds": 60,
+                    "90 seconds": 90,
+                    "2 minutes": 120,
+                    "3 minutes": 180,
+                    "Custom": None,
+                }
+                timer_choice = st.selectbox(
+                    "Rest duration",
+                    list(timer_options.keys()),
+                    index=2,
+                    key="rest_timer_choice",
+                    help="The timer starts automatically after a set is saved.",
+                )
+                if timer_choice == "Custom":
+                    rest_seconds = int(
+                        st.number_input(
+                            "Custom rest time (seconds)",
+                            min_value=15,
+                            max_value=900,
+                            value=int(st.session_state.get("rest_timer_custom_seconds", 90)),
+                            step=15,
+                            key="rest_timer_custom_seconds",
+                        )
+                    )
+                else:
+                    rest_seconds = int(timer_options[timer_choice])
+                st.caption("The timer is a visual aid. Phone/browser background behavior can vary.")
 
             existing_sets = get_sets(current_instance["id"], user_id)
             logical_numbers = sorted({int(x["set_num"]) for x in existing_sets})
@@ -1692,6 +2061,10 @@ elif page == PAGE_WORKOUT:
                                 rir=rir,
                                 implement_count=implement_count,
                             )
+                            if rest_seconds > 0:
+                                start_rest_timer(rest_seconds)
+                            else:
+                                clear_rest_timer()
                             st.rerun()
                         except Exception as exc:
                             st.error("⚠️ The set was NOT saved.")
@@ -1748,6 +2121,10 @@ elif page == PAGE_WORKOUT:
                                 rir_right=rir_right,
                                 implement_count=implement_count,
                             )
+                            if rest_seconds > 0:
+                                start_rest_timer(rest_seconds)
+                            else:
+                                clear_rest_timer()
                             st.rerun()
                         except Exception as exc:
                             st.error("⚠️ The set was NOT saved.")
@@ -1757,11 +2134,13 @@ elif page == PAGE_WORKOUT:
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Next exercise ➜", use_container_width=True):
+                    clear_rest_timer()
                     clear_current_exercise()
                     st.rerun()
             with col2:
                 if st.button("🏁 Finish workout", use_container_width=True, type="primary"):
                     try:
+                        clear_rest_timer()
                         finish_workout(workout_id, user_id)
                         st.rerun()
                     except Exception as exc:
@@ -1772,6 +2151,7 @@ elif page == PAGE_WORKOUT:
             st.divider()
             if st.button("🏁 Finish workout", use_container_width=True):
                 try:
+                    clear_rest_timer()
                     finish_workout(workout_id, user_id)
                     st.rerun()
                 except Exception as exc:
@@ -2030,6 +2410,15 @@ elif page == PAGE_PROFILE:
             except Exception as exc:
                 st.error("The profile could not be saved.")
                 st.caption(str(exc))
+
+
+# ============================================================
+# HOW TO USE
+# ============================================================
+
+elif page == PAGE_HELP:
+    st.header("How to use Daughter Lift")
+    render_how_to_use()
 
 
 # ============================================================
